@@ -1,3 +1,6 @@
+// Changed 2026-11-21, not in upstream gpui-ce: custom GPU controls on Windows
+// (branch `windows-custom-gpu`): gpu_context_info on Windows.
+
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds,
@@ -7064,12 +7067,13 @@ impl Window {
 
     /// Returns backend-specific typed GPU context information for custom
     /// controls. Use the rendering backend's context type to downcast the
-    /// returned value.
+    /// returned value (on Windows, [`crate::WindowsGpuAdapter`]).
     #[cfg(any(
         target_family = "wasm",
         target_os = "linux",
         target_os = "freebsd",
-        target_os = "macos"
+        target_os = "macos",
+        target_os = "windows"
     ))]
     pub fn gpu_context_info(&self) -> Option<Box<dyn std::any::Any>> {
         self.platform_window.gpu_context_info()

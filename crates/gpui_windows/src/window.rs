@@ -1,3 +1,6 @@
+// Changed 2026-11-21, not in upstream gpui-ce: custom GPU controls on Windows
+// (branch `windows-custom-gpu`): gpu_context_info gives the window's adapter.
+
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::{
@@ -1120,6 +1123,12 @@ impl PlatformWindow for WindowsWindow {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.state.renderer.borrow().gpu_specs().log_err()
+    }
+
+    /// The window's adapter: a custom GPU control makes its device on it (gpui_wgpu).
+    fn gpu_context_info(&self) -> Option<Box<dyn std::any::Any>> {
+        let adapter = self.state.renderer.borrow().gpu_adapter().log_err()?;
+        Some(Box::new(adapter))
     }
 
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {

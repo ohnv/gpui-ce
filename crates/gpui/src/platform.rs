@@ -1,3 +1,6 @@
+// Changed 2026-11-21, not in upstream gpui-ce: custom GPU controls on Windows
+// (branch `windows-custom-gpu`): the shared surface types, gpu_context_info on Windows.
+
 mod app_menu;
 mod keyboard;
 mod keystroke;
@@ -24,6 +27,12 @@ pub mod screen_capture;
 mod windows_screen_capture;
 #[cfg(target_os = "windows")]
 pub use windows_screen_capture::WindowsScreenCaptureFrame;
+#[cfg(target_os = "windows")]
+mod windows_shared_surface;
+#[cfg(target_os = "windows")]
+pub use windows_shared_surface::{
+    WindowsGpuAdapter, WindowsSharedHandle, WindowsSharedSurface, WindowsSurfaceSync,
+};
 
 #[cfg(all(target_os = "windows", feature = "screen-capture"))]
 pub(crate) type PlatformScreenCaptureFrame = WindowsScreenCaptureFrame;
@@ -1021,12 +1030,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
 
     /// Returns typed backend-specific GPU context information for custom
     /// controls. The value is intentionally type-erased in this crate so the
-    /// core UI crate does not depend on a rendering backend.
+    /// core UI crate does not depend on a rendering backend. On Windows it is
+    /// the window's [`WindowsGpuAdapter`].
     #[cfg(any(
         target_family = "wasm",
         target_os = "linux",
         target_os = "freebsd",
-        target_os = "macos"
+        target_os = "macos",
+        target_os = "windows"
     ))]
     fn gpu_context_info(&self) -> Option<Box<dyn std::any::Any>> {
         None

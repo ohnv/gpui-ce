@@ -1,3 +1,6 @@
+// Changed 2026-11-21, not in upstream gpui-ce: custom GPU controls on Windows
+// (branch `windows-custom-gpu`): draws SurfaceSource::WindowsShared, gives its adapter.
+
 use std::{
     slice,
     sync::{Arc, OnceLock},
@@ -24,7 +27,7 @@ use smallvec::SmallVec;
 use wgsl_rs::std::{vec2f, vec4f};
 use windows::{
     Win32::{
-        Foundation::{FreeLibrary, HMODULE, HWND},
+        Foundation::{FreeLibrary, HANDLE, HMODULE, HWND},
         Graphics::{
             Direct3D::*,
             Direct3D11::*,
@@ -119,6 +122,10 @@ struct DirectXResources {
     // underlying texture alive makes its COM pointer a stable cache key.
     surface_views: FxHashMap<usize, CachedSurfaceView>,
 
+    // Custom GPU controls' shared textures referenced by the current scene, opened on this
+    // device, by the surface's id; `None` for one that could not be opened (said once).
+    shared_surfaces: FxHashMap<u64, Option<SharedSurfaceView>>,
+
     // Cached viewport
     viewport: D3D11_VIEWPORT,
 }
@@ -127,6 +134,61 @@ struct CachedSurfaceView {
     #[expect(dead_code)]
     texture: ID3D11Texture2D,
     srv: Option<ID3D11ShaderResourceView>,
+}
+
+/// A custom GPU control's texture (`SurfaceSource::WindowsShared`), opened on this renderer's
+/// device with the two fences that order its use (gpui's `windows_shared_surface`).
+struct SharedSurfaceView {
+    #[expect(dead_code)]
+    texture: ID3D11Texture2D,
+    srv: Option<ID3D11ShaderResourceView>,
+    produced: ID3D11Fence,
+    consumed: ID3D11Fence,
+    context: ID3D11DeviceContext4,
+    sync: Arc<dyn gpui::WindowsSurfaceSync>,
+}
+
+impl SharedSurfaceView {
+    fn open(devices: &DirectXRendererDevices, shared: &gpui::WindowsSharedSurface) -> Result<Self> {
+        let device1: ID3D11Device1 = devices
+            .device
+            .cast()
+            .context("shared textures need ID3D11Device1")?;
+        let device5: ID3D11Device5 = devices
+            .device
+            .cast()
+            .context("shared fences need Direct3D 11.4 (Windows 10 1703)")?;
+        let context: ID3D11DeviceContext4 = devices
+            .device_context
+            .cast()
+            .context("shared fences need ID3D11DeviceContext4")?;
+        let texture: ID3D11Texture2D =
+            unsafe { device1.OpenSharedResource1(HANDLE(shared.texture_handle())) }
+                .context("opening the shared texture (made on another adapter?)")?;
+        let fence = |handle, what: &str| -> Result<ID3D11Fence> {
+            let mut fence: Option<ID3D11Fence> = None;
+            unsafe { device5.OpenSharedFence(HANDLE(handle), &mut fence) }
+                .with_context(|| format!("opening the shared texture's {what} fence"))?;
+            fence.with_context(|| format!("Direct3D 11 gave no {what} fence"))
+        };
+        let produced = fence(shared.produced_handle(), "produced")?;
+        let consumed = fence(shared.consumed_handle(), "consumed")?;
+        let mut srv = None;
+        unsafe {
+            devices
+                .device
+                .CreateShaderResourceView(&texture, None, Some(&mut srv))
+        }
+        .context("viewing the shared texture")?;
+        Ok(Self {
+            texture,
+            srv,
+            produced,
+            consumed,
+            context,
+            sync: shared.sync().clone(),
+        })
+    }
 }
 
 struct PathResources {
@@ -467,6 +529,12 @@ impl DirectXRenderer {
                     .log_err();
             }
 
+            // What was promised to shared surfaces' producers may never be signalled now.
+            if let Some(resources) = &self.resources {
+                for opened in resources.shared_surfaces.values().flatten() {
+                    opened.sync.abandon();
+                }
+            }
             self.resources.take();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);
@@ -1183,33 +1251,67 @@ impl DirectXRenderer {
         let sampler = [self.globals.sampler.clone()];
 
         for (index, surface) in surfaces.iter().enumerate() {
-            let gpui::SurfaceSource::WindowsCapture(frame) = &surface.source else {
-                log::error!("DirectX renderer cannot import this surface source");
-                anyhow::bail!("unsupported surface source");
+            // What to read, and for a custom control's shared texture what to signal once read.
+            let (texture_srv, shared) = match &surface.source {
+                gpui::SurfaceSource::WindowsCapture(frame) => {
+                    let key = frame.texture().as_raw() as usize;
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        resources.surface_views.entry(key)
+                    {
+                        let mut srv = None;
+                        // Screen capture uses windows 0.61 while this renderer uses 0.62. COM
+                        // interface pointers are ABI-stable; transferring an owned clone keeps
+                        // the texture alive.
+                        let texture = unsafe {
+                            ID3D11Texture2D::from_raw(frame.texture().clone().into_raw())
+                        };
+                        unsafe {
+                            devices.device.CreateShaderResourceView(
+                                &texture,
+                                None,
+                                Some(&mut srv),
+                            )?
+                        };
+                        entry.insert(CachedSurfaceView { texture, srv });
+                    }
+                    let srv = resources
+                        .surface_views
+                        .get(&key)
+                        .context("capture surface view cache insertion failed")?
+                        .srv
+                        .clone();
+                    (srv, None)
+                }
+                gpui::SurfaceSource::WindowsShared(shared) => {
+                    let opened = resources
+                        .shared_surfaces
+                        .entry(shared.id())
+                        .or_insert_with(|| SharedSurfaceView::open(devices, shared).log_err());
+                    let Some(opened) = opened.as_ref() else {
+                        continue;
+                    };
+                    // the producer's work so far, finished on the GPU before this reads it
+                    let Some(value) = opened.sync.begin_read() else {
+                        continue;
+                    };
+                    unsafe { opened.context.Wait(&opened.produced, value) }
+                        .context("waiting for a shared surface's producer")?;
+                    (
+                        opened.srv.clone(),
+                        Some((
+                            opened.context.clone(),
+                            opened.consumed.clone(),
+                            opened.sync.clone(),
+                        )),
+                    )
+                }
+                _ => {
+                    log::error!("DirectX renderer cannot import this surface source");
+                    anyhow::bail!("unsupported surface source");
+                }
             };
-            let key = frame.texture().as_raw() as usize;
-            if let std::collections::hash_map::Entry::Vacant(entry) =
-                resources.surface_views.entry(key)
-            {
-                let mut srv = None;
-                // Screen capture uses windows 0.61 while this renderer uses 0.62. COM interface
-                // pointers are ABI-stable; transferring an owned clone keeps the texture alive.
-                let texture =
-                    unsafe { ID3D11Texture2D::from_raw(frame.texture().clone().into_raw()) };
-                unsafe {
-                    devices
-                        .device
-                        .CreateShaderResourceView(&texture, None, Some(&mut srv))?
-                };
-                entry.insert(CachedSurfaceView { texture, srv });
-            }
-            let texture_srv = &resources
-                .surface_views
-                .get(&key)
-                .context("capture surface view cache insertion failed")?
-                .srv;
             // The surface shader declares both planes; RGBA captures bind one view to both.
-            let texture_srvs = [texture_srv.clone(), texture_srv.clone()];
+            let texture_srvs = [texture_srv.clone(), texture_srv];
 
             let uniforms = SurfaceUniforms {
                 bounds: surface.bounds.into(),
@@ -1238,6 +1340,12 @@ impl DirectXRenderer {
                 ctx.PSSetSamplers(SURFACE_SAMPLER_REGISTER, Some(&sampler));
                 ctx.OMSetBlendState(&self.pipelines.surfaces.blend, None, 0xFFFFFFFF);
                 ctx.DrawInstanced(4, 1, 0, 0);
+            }
+            // Read (on the GPU, after the draw): the producer may write it again.
+            if let Some((context, consumed, sync)) = shared {
+                let value = sync.end_read();
+                unsafe { context.Signal(&consumed, value) }
+                    .context("signalling a shared surface's read")?;
             }
         }
         Ok(())
@@ -1458,6 +1566,16 @@ impl DirectXRenderer {
         )
     }
 
+    /// The adapter this renderer draws with, for a custom GPU control to make its device on.
+    pub(crate) fn gpu_adapter(&self) -> Result<gpui::WindowsGpuAdapter> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let desc = unsafe { devices.adapter.GetDesc1() }?;
+        let luid = desc.AdapterLuid;
+        Ok(gpui::WindowsGpuAdapter {
+            luid: ((luid.HighPart as i64) << 32) | luid.LowPart as i64,
+        })
+    }
+
     pub(crate) fn gpu_specs(&self) -> Result<GpuSpecs> {
         let devices = self.devices.as_ref().context("devices missing")?;
         let desc = unsafe { devices.adapter.GetDesc1() }?;
@@ -1537,6 +1655,7 @@ impl DirectXResources {
             path: None,
             blur: None,
             surface_views: FxHashMap::default(),
+            shared_surfaces: FxHashMap::default(),
             viewport,
         })
     }
@@ -1608,6 +1727,15 @@ impl DirectXResources {
             .collect::<SmallVec<[usize; 4]>>();
         self.surface_views
             .retain(|key, _| active_keys.contains(key));
+        let active_shared = surfaces
+            .iter()
+            .filter_map(|surface| match &surface.source {
+                gpui::SurfaceSource::WindowsShared(shared) => Some(shared.id()),
+                _ => None,
+            })
+            .collect::<SmallVec<[u64; 4]>>();
+        self.shared_surfaces
+            .retain(|id, _| active_shared.contains(id));
     }
 }
 

@@ -1,5 +1,10 @@
+// Changed 2026-11-21, not in upstream gpui-ce: custom GPU controls on Windows
+// (branch `windows-custom-gpu`): the windows_shared module.
+
 mod wgpu_atlas;
 mod wgpu_context;
+#[cfg(all(target_os = "windows", feature = "custom-gpu"))]
+mod windows_shared;
 mod wgpu_renderer;
 
 pub use wgpu;

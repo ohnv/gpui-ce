@@ -1,9 +1,12 @@
-#[cfg(target_os = "windows")]
-use crate::WindowsScreenCaptureFrame;
+// Changed 2026-11-21, not in upstream gpui-ce: custom GPU controls on Windows
+// (branch `windows-custom-gpu`): SurfaceSource::WindowsShared.
+
 use crate::{
     App, Bounds, DevicePixels, Element, ElementId, GlobalElementId, InspectorElementId,
     IntoElement, LayoutId, ObjectFit, Pixels, Size, Style, StyleRefinement, Styled, Window,
 };
+#[cfg(target_os = "windows")]
+use crate::{WindowsScreenCaptureFrame, WindowsSharedSurface};
 #[cfg(target_os = "macos")]
 use core_video::pixel_buffer::CVPixelBuffer;
 use refineable::Refineable;
@@ -36,6 +39,10 @@ pub enum SurfaceSource {
     /// A native Windows Graphics Capture texture.
     #[cfg(target_os = "windows")]
     WindowsCapture(WindowsScreenCaptureFrame),
+    /// A texture another Direct3D device renders, shared with the window's
+    /// (a custom GPU control on Windows).
+    #[cfg(target_os = "windows")]
+    WindowsShared(WindowsSharedSurface),
     /// A placeholder for platforms that cannot import native surfaces.
     #[doc(hidden)]
     Unsupported(Size<DevicePixels>),
@@ -58,6 +65,8 @@ impl std::fmt::Debug for SurfaceSource {
                 .finish_non_exhaustive(),
             #[cfg(target_os = "windows")]
             SurfaceSource::WindowsCapture(ref frame) => frame.fmt(_f),
+            #[cfg(target_os = "windows")]
+            SurfaceSource::WindowsShared(ref surface) => surface.fmt(_f),
             SurfaceSource::Unsupported(size) => _f.debug_tuple("Unsupported").field(&size).finish(),
         }
     }
@@ -79,6 +88,8 @@ impl SurfaceSource {
             SurfaceSource::Texture { size, .. } => *size,
             #[cfg(target_os = "windows")]
             SurfaceSource::WindowsCapture(frame) => frame.size(),
+            #[cfg(target_os = "windows")]
+            SurfaceSource::WindowsShared(surface) => surface.size(),
             SurfaceSource::Unsupported(size) => *size,
         }
     }
@@ -95,6 +106,13 @@ impl From<CVPixelBuffer> for SurfaceSource {
 impl From<WindowsScreenCaptureFrame> for SurfaceSource {
     fn from(value: WindowsScreenCaptureFrame) -> Self {
         SurfaceSource::WindowsCapture(value)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl From<WindowsSharedSurface> for SurfaceSource {
+    fn from(value: WindowsSharedSurface) -> Self {
+        SurfaceSource::WindowsShared(value)
     }
 }
 

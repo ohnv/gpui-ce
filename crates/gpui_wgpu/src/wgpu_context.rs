@@ -1,3 +1,6 @@
+// Changed 2026-11-21, not in upstream gpui-ce: custom GPU controls on Windows
+// (branch `windows-custom-gpu`): from_window and shared render targets on Windows, WgpuRenderTarget::source.
+
 #[cfg(not(target_family = "wasm"))]
 use anyhow::Context as _;
 #[cfg(not(target_family = "wasm"))]
@@ -263,6 +266,10 @@ pub struct WgpuContextHandle {
     features: wgpu::Features,
     limits: wgpu::Limits,
     device_lost: Arc<AtomicBool>,
+    /// On Windows, the fences the device shares with the windows it draws
+    /// into: its render targets are then textures shared with them.
+    #[cfg(all(target_os = "windows", feature = "custom-gpu"))]
+    pub(crate) windows: Option<Arc<crate::windows_shared::Exchange>>,
 }
 
 impl WgpuContextHandle {
@@ -285,6 +292,8 @@ impl WgpuContextHandle {
             features,
             limits,
             device_lost,
+            #[cfg(all(target_os = "windows", feature = "custom-gpu"))]
+            windows: None,
         }
     }
 
@@ -348,6 +357,20 @@ impl WgpuContextHandle {
             .ok()
             .map(|context| *context)
     }
+
+    /// Returns the wgpu context for custom controls in a GPUI window. A
+    /// Windows window draws with Direct3D 11, so this is a Direct3D 12 device
+    /// of this process on the window's adapter, the same for every window on
+    /// it, whose render targets the window composites with no copy
+    /// (`windows_shared`).
+    #[cfg(all(target_os = "windows", feature = "custom-gpu"))]
+    pub fn from_window(window: &gpui::Window) -> Option<Self> {
+        let adapter = window
+            .gpu_context_info()?
+            .downcast::<gpui::WindowsGpuAdapter>()
+            .ok()?;
+        crate::windows_shared::context_for(*adapter)
+    }
 }
 
 /// A reusable offscreen render target suitable for [`gpui::Window::paint_surface`].
@@ -356,6 +379,41 @@ pub struct WgpuRenderTarget {
     view: wgpu::TextureView,
     size: gpui::Size<gpui::DevicePixels>,
     format: wgpu::TextureFormat,
+    shared: TargetShare,
+}
+
+/// What a render target shares with the window: on Windows, the texture is
+/// shared with its renderer (`windows_shared`); elsewhere the window's own
+/// device renders it, and nothing is.
+#[cfg(all(target_os = "windows", feature = "custom-gpu"))]
+type TargetShare = Option<crate::windows_shared::SharedTarget>;
+#[cfg(not(all(target_os = "windows", feature = "custom-gpu")))]
+type TargetShare = ();
+
+const TARGET_USAGE: wgpu::TextureUsages =
+    wgpu::TextureUsages::RENDER_ATTACHMENT.union(wgpu::TextureUsages::TEXTURE_BINDING);
+
+/// A target's texture: on Windows shared with the window when its context can,
+/// else a texture of the device's own.
+fn target_texture(
+    context: &WgpuContextHandle,
+    size: gpui::Size<gpui::DevicePixels>,
+    format: wgpu::TextureFormat,
+) -> (wgpu::Texture, TargetShare) {
+    #[cfg(all(target_os = "windows", feature = "custom-gpu"))]
+    if let Some(exchange) = &context.windows {
+        match crate::windows_shared::create_target(context, exchange, size, format, TARGET_USAGE) {
+            Ok((texture, shared)) => return (texture, Some(shared)),
+            Err(error) => {
+                log::error!("{error:#}: this render target cannot be shown in a window")
+            }
+        }
+    }
+    let texture = create_render_target_texture(context.device(), size, format);
+    #[cfg(all(target_os = "windows", feature = "custom-gpu"))]
+    return (texture, None);
+    #[cfg(not(all(target_os = "windows", feature = "custom-gpu")))]
+    (texture, ())
 }
 
 impl WgpuRenderTarget {
@@ -371,13 +429,14 @@ impl WgpuRenderTarget {
         format: wgpu::TextureFormat,
     ) -> Self {
         let size = normalize_target_size(size);
-        let texture = create_render_target_texture(context.device(), size, format);
+        let (texture, shared) = target_texture(context, size, format);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         Self {
             texture: Arc::new(texture),
             view,
             size,
             format,
+            shared,
         }
     }
 
@@ -387,10 +446,11 @@ impl WgpuRenderTarget {
         if self.size == size {
             return;
         }
-        let texture = create_render_target_texture(context.device(), size, self.format);
+        let (texture, shared) = target_texture(context, size, self.format);
         self.view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.texture = Arc::new(texture);
         self.size = size;
+        self.shared = shared;
     }
 
     /// Returns the target texture for use as a GPUI surface.
@@ -403,17 +463,45 @@ impl WgpuRenderTarget {
         target_os = "linux",
         target_os = "freebsd",
         all(target_os = "macos", feature = "custom-gpu"),
-        all(target_family = "wasm", feature = "custom-gpu")
+        all(target_family = "wasm", feature = "custom-gpu"),
+        all(target_os = "windows", feature = "custom-gpu")
     ))]
     pub fn surface(&self) -> gpui::Surface {
-        gpui::surface(gpui::SurfaceSource::Texture {
-            texture: self.texture(),
-            size: self.size,
-        })
+        gpui::surface(self.source())
     }
 
-    /// Returns the target texture view for rendering.
+    /// The source that composites this target, for [`gpui::Window::paint_surface`]
+    /// (what [`Self::surface`] shows). Unsupported where the platform cannot
+    /// show a target, or on Windows where it could not be shared.
+    pub fn source(&self) -> gpui::SurfaceSource {
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            all(target_os = "macos", feature = "custom-gpu"),
+            all(target_family = "wasm", feature = "custom-gpu")
+        ))]
+        return gpui::SurfaceSource::Texture {
+            texture: self.texture(),
+            size: self.size,
+        };
+        #[cfg(all(target_os = "windows", feature = "custom-gpu"))]
+        return match &self.shared {
+            Some(shared) => shared.surface.clone().into(),
+            None => gpui::SurfaceSource::Unsupported(self.size),
+        };
+        #[allow(unreachable_code)]
+        gpui::SurfaceSource::Unsupported(self.size)
+    }
+
+    /// Returns the target texture view for rendering. On Windows it also
+    /// orders what is rendered after the window's last read of the target
+    /// (the device's queue waits for it on the GPU): take the view for each
+    /// frame rendered into it.
     pub fn view(&self) -> &wgpu::TextureView {
+        #[cfg(all(target_os = "windows", feature = "custom-gpu"))]
+        if let Some(shared) = &self.shared {
+            shared.exchange.before_write();
+        }
         &self.view
     }
 
@@ -451,7 +539,7 @@ fn create_render_target_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: TARGET_USAGE,
         view_formats: &[],
     })
 }
@@ -480,6 +568,20 @@ impl WgpuContext {
             self.backend,
             Arc::clone(&self.device_lost),
         )
+    }
+
+    /// A Direct3D 12 device on the adapter of this locally unique id, without a
+    /// presentation surface: a Windows window's custom controls' (`windows_shared`).
+    #[cfg(all(target_os = "windows", feature = "custom-gpu"))]
+    pub(crate) fn new_on_dx12_adapter(luid: i64) -> anyhow::Result<Self> {
+        let instance = NativeBackend::Dx12.instance(None);
+        let adapters = gpui::block_on(instance.raw.enumerate_adapters(wgpu::Backends::DX12));
+        let adapter = adapters
+            .into_iter()
+            .find(|adapter| crate::windows_shared::adapter_luid(adapter) == Some(luid))
+            .context("the window's adapter has no Direct3D 12 device")?;
+        let device = gpui::block_on(Self::create_device(&adapter, None))?;
+        Self::from_created_device(instance.raw, adapter, device)
     }
 
     /// Creates a native device without a presentation surface.
