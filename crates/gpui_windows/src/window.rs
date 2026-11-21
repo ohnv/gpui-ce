@@ -1,5 +1,6 @@
 // Changed 2026-11-21, not in upstream gpui-ce: custom GPU controls on Windows
-// (branch `windows-custom-gpu`): gpu_context_info gives the window's adapter.
+// (branch `windows-custom-gpu`): gpu_context_info gives the window's adapter; an
+// unfocused window asked to open on no display stays there (off screen).
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -554,8 +555,13 @@ impl WindowsWindow {
         set_non_rude_hwnd(hwnd, true);
         configure_dwm_dark_mode(hwnd, appearance);
         this.state.border_offset.update(hwnd)?;
-        let placement =
-            retrieve_window_placement(hwnd, display, params.bounds, &this.state.border_offset)?;
+        let placement = retrieve_window_placement(
+            hwnd,
+            display,
+            params.bounds,
+            &this.state.border_offset,
+            !params.focus,
+        )?;
         if params.show {
             let mut placement = placement;
             if !params.focus {
@@ -1644,14 +1650,20 @@ fn retrieve_window_placement(
     display: WindowsDisplay,
     initial_bounds: Bounds<Pixels>,
     border_offset: &WindowBorderOffset,
+    unfocused: bool,
 ) -> Result<WINDOWPLACEMENT> {
     let mut placement = WINDOWPLACEMENT {
         length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
         ..Default::default()
     };
     unsafe { GetWindowPlacement(hwnd, &mut placement)? };
-    // the bounds may be not inside the display
-    let bounds = if display.check_given_bounds(initial_bounds) {
+    // the bounds may be not inside the display: a window is then placed on it,
+    // unless it opens unfocused on no display at all, which is a window meant
+    // off screen (`VisualTestAppContext::open_offscreen_window`, an application's
+    // off-screen runs): the compositor still renders it, and nobody sees it
+    let bounds = if display.check_given_bounds(initial_bounds)
+        || (unfocused && on_no_display(initial_bounds, display.scale_factor()))
+    {
         initial_bounds
     } else {
         display.default_bounds()
@@ -1666,6 +1678,18 @@ fn retrieve_window_placement(
     let bounds = bounds.to_device_pixels(display.scale_factor());
     placement.rcNormalPosition = calculate_window_rect(bounds, border_offset);
     Ok(placement)
+}
+
+/// Whether no display holds any of `bounds` (logical pixels at `scale_factor`).
+fn on_no_display(bounds: Bounds<Pixels>, scale_factor: f32) -> bool {
+    let device = bounds.to_device_pixels(scale_factor);
+    let rect = RECT {
+        left: device.origin.x.0,
+        top: device.origin.y.0,
+        right: device.origin.x.0 + device.size.width.0,
+        bottom: device.origin.y.0 + device.size.height.0,
+    };
+    unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) }.is_invalid()
 }
 
 fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
