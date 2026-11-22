@@ -1,3 +1,8 @@
+// Changed 2026-11-22, not in upstream gpui-ce (branch `windows-custom-gpu`): the
+// caption press `start_window_move` posts goes to DefWindowProc, never to the
+// app, which had its own press already and took this one too where it pressed a
+// control of its title bar, so the window never moved.
+
 use std::{cell::Cell, rc::Rc, sync::atomic::Ordering};
 
 use anyhow::Context as _;
@@ -1061,6 +1066,15 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Option<isize> {
+        // `start_window_move`'s own press (it posts it, `dragging` set): the
+        // app asked for the move from its press, so this one is DefWindowProc's,
+        // which moves the window
+        if button == MouseButton::Left
+            && wparam.0 as u32 == HTCAPTION
+            && self.state.dragging.get()
+        {
+            return None;
+        }
         if let Some(mut func) = self.state.callbacks.input.take() {
             let scale_factor = self.state.scale_factor.get();
             let mut cursor_point = POINT {

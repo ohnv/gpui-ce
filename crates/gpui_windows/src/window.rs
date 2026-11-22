@@ -1,6 +1,8 @@
 // Changed 2026-11-21, not in upstream gpui-ce: custom GPU controls on Windows
 // (branch `windows-custom-gpu`): gpu_context_info gives the window's adapter; an
 // unfocused window asked to open on no display stays there (off screen).
+// Changed 2026-11-22: start_window_move gives the caption press it posts the
+// cursor's place packed in its LPARAM, as WM_NCLBUTTONDOWN takes it.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -1031,10 +1033,9 @@ impl PlatformWindow for WindowsWindow {
             let _ = unsafe { GetCursorPos(&mut pos) };
             pos
         };
-        let points = POINTS {
-            x: cursor_pos.x as i16,
-            y: cursor_pos.y as i16,
-        };
+        // the point packed as WM_NCLBUTTONDOWN's LPARAM is (MAKELPARAM), not a
+        // pointer to it: the message is posted, read once this has returned
+        let packed = ((cursor_pos.y as u16 as u32) << 16) | (cursor_pos.x as u16 as u32);
 
         let _ = unsafe { ReleaseCapture() };
         let _ = unsafe {
@@ -1042,7 +1043,7 @@ impl PlatformWindow for WindowsWindow {
                 Some(self.0.hwnd),
                 WM_NCLBUTTONDOWN,
                 WPARAM(HTCAPTION as usize),
-                LPARAM(&points as *const _ as isize),
+                LPARAM(packed as isize),
             )
         };
     }
