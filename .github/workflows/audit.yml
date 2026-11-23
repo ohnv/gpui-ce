@@ -21,7 +21,11 @@ permissions:
 
 jobs:
   # cargo-audit: vulnerability scanning (advisory DB)
+  # Not on the weekly run: there it opens a GitHub issue for every warning,
+  # which its token may not, so the run failed. cargo-deny below checks the
+  # same advisories and fails on a vulnerability.
   cargo-audit:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
